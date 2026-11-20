@@ -47,7 +47,7 @@ static struct {
     size_t garlic_used;
 } gnm;
 
-#define GARLIC_SIZE (4u << 20)
+#define GARLIC_SIZE (32u << 20)
 
 void *gnm_alloc_garlic(size_t size, size_t align)
 {

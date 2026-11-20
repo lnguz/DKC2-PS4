@@ -21,6 +21,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -61,7 +62,7 @@ int sceSystemServiceGetStatus(Ps4SystemStatus *status);
 #define DATA_DIR "/data/DKC2"
 #define LOG_PATH DATA_DIR "/debug.log"
 #define CONFIG_PATH DATA_DIR "/ps4.cfg"
-#define VERSION_TEXT "1.01"
+#define VERSION_TEXT "1.02"
 
 /* ------------------------------------------------------------------ log */
 
@@ -83,15 +84,22 @@ static void Log(const char *format, ...) {
 static void OpenLog(void) {
   mkdir(DATA_DIR, 0777);
   g_log = fopen(LOG_PATH, "w");
-  /* The runtime reports through stdout/stderr: point both at the log. */
+  /* The runtime reports through stdout/stderr. The console refuses dup2 onto
+   * descriptors 1 and 2, so the descriptor inside musl's FILE (offset 0x78,
+   * the field fileno() reads; validated in the Downhill port) is pointed at
+   * the log instead, only when the layout checks out. */
   if (g_log) {
     int fd = open(LOG_PATH, O_WRONLY | O_APPEND);
-    if (fd >= 0) {
-      dup2(fd, 1);
-      dup2(fd, 2);
+    if (fd >= 0 && fileno(stderr) == 2 && fileno(stdout) == 1 &&
+        *(int *)((char *)stderr + 0x78) == 2 &&
+        *(int *)((char *)stdout + 0x78) == 1) {
+      fflush(stdout);
+      fflush(stderr);
+      *(int *)((char *)stderr + 0x78) = fd;
+      *(int *)((char *)stdout + 0x78) = fd;
     }
     setvbuf(stderr, NULL, _IONBF, 0);
-    setvbuf(stdout, NULL, _IOLBF, 0);
+    setvbuf(stdout, NULL, _IONBF, 0);
   }
 }
 
@@ -160,7 +168,6 @@ static OrbisKernelEqueue g_flip_queue;
 static uint32_t *g_display[kDisplayBuffers];
 static int g_current_buffer;
 static int64_t g_flip_count;
-static uint32_t g_pixels[kSourceMaxWidth * kSourceHeight];
 static uint16_t g_column_map[kDisplayWidth];
 static uint16_t g_row_map[kDisplayHeight];
 static int g_out_x, g_out_width, g_mapped_width = -1;
@@ -245,8 +252,49 @@ static void FinishFrame(void) {
   g_current_buffer = (g_current_buffer + 1) % kDisplayBuffers;
 }
 
-static void DrawGame(uint32_t *display, bool dim) {
-  const int source_width = Dkc2VideoWidth();
+/* Frames travel from the emulation thread to the presenter through a triple
+ * buffer: the emulator draws into one, the presenter reads another, and the
+ * third holds the newest finished frame. */
+typedef struct {
+  uint32_t pixels[kSourceMaxWidth * kSourceHeight];
+  int width;
+} Frame;
+
+static Frame g_frames[3];
+static int g_frame_draw = 0, g_frame_ready = 1, g_frame_show = 2;
+static bool g_frame_fresh;
+static pthread_mutex_t g_frame_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Emulation side: the frame just drawn becomes the newest, and the PPU
+ * draws the next one into the spare buffer. */
+static void PublishFrame(void) {
+  pthread_mutex_lock(&g_frame_lock);
+  g_frames[g_frame_draw].width = Dkc2VideoWidth();
+  int finished = g_frame_draw;
+  g_frame_draw = g_frame_ready;
+  g_frame_ready = finished;
+  g_frame_fresh = true;
+  pthread_mutex_unlock(&g_frame_lock);
+  Dkc2BeginDrawing((uint8_t *)g_frames[g_frame_draw].pixels,
+                   (size_t)Dkc2VideoWidth() * 4);
+}
+
+/* Presenter side: the newest frame (or the last one again). */
+static const Frame *TakeFrame(void) {
+  pthread_mutex_lock(&g_frame_lock);
+  if (g_frame_fresh) {
+    int newest = g_frame_ready;
+    g_frame_ready = g_frame_show;
+    g_frame_show = newest;
+    g_frame_fresh = false;
+  }
+  pthread_mutex_unlock(&g_frame_lock);
+  return &g_frames[g_frame_show];
+}
+
+static void DrawGame(uint32_t *display, const Frame *frame, bool dim) {
+  const int source_width = frame->width;
+  const uint32_t *pixels = frame->pixels;
   if (source_width != g_mapped_width) MapColumns(source_width);
   if (g_buffer_out_x[g_current_buffer] != g_out_x) {
     memset(display, 0, kDisplayBufferSize); /* clear stale side bars */
@@ -258,7 +306,7 @@ static void DrawGame(uint32_t *display, bool dim) {
   for (int y = 0; y < kDisplayHeight; y++) {
     if (g_row_map[y] != converted) {
       converted = g_row_map[y];
-      const uint32_t *source = g_pixels + (size_t)converted * source_width;
+      const uint32_t *source = pixels + (size_t)converted * source_width;
       if (dim) {
         for (int x = 0; x < g_out_width; x++)
           row[x] = 0xFF000000u | ((source[g_column_map[x]] >> 2) & 0x3F3F3Fu);
@@ -272,23 +320,130 @@ static void DrawGame(uint32_t *display, bool dim) {
   }
 }
 
-/* GPU scaler (ps4/kernels/scale.cl): PIXELS = sharp bilinear, HD = xBR.
+/* GPU scaler.
+ *  PIXELS: ps4/kernels/scale.cl mode 0 (sharp bilinear), one dispatch.
+ *  HD: ps4/kernels/scalefx.cl, ScaleFX 3x (5 passes) -> Lanczos2 to the
+ *      output size -> CAS sharpening into the display buffer.
  * Falls back to DrawGame on the CPU when the GPU path is unavailable. */
-static bool g_gpu;
-static GnmKernel g_scale_kernel;
+static bool g_gpu, g_gpu_hd;
+static GnmKernel g_scale_kernel, g_sfx_kernel[5], g_lanczos_kernel, g_cas_kernel;
 static uint32_t *g_gpu_source;
 static uint64_t g_gpu_wait_us;
 
+enum { kHdScale = 3, kLanczosTaps = 4 };
+static const float kCasSharpness = 0.5f;
+
+typedef struct { float v[4]; } Taps;
+static float (*g_sfx_m0)[4], (*g_sfx_s1)[4];
+static uint32_t *g_sfx_p2, *g_sfx_p3, *g_sfx_x3, *g_lanczos_out;
+static int32_t *g_lz_cols, *g_lz_rows;
+static Taps *g_lz_colw, *g_lz_roww;
+static int g_lz_source_width = -1, g_lz_out_width = -1;
+
+static void *GarlicAlloc(size_t size) { return gnm_alloc_garlic(size, 256); }
+
 static void GpuInit(void) {
   g_gpu = gnm_init() && gnm_kernel("scale", &g_scale_kernel) &&
-          (g_gpu_source = (uint32_t *)gnm_alloc_garlic(sizeof g_pixels, 256));
-  Log("GPU scaler: %s", g_gpu ? "on" : "off (CPU nearest)");
+          (g_gpu_source = (uint32_t *)GarlicAlloc(sizeof g_frames[0].pixels));
+  if (g_gpu) {
+    static const char *const names[5] = {"sfx0", "sfx1", "sfx2", "sfx3", "sfx4"};
+    const size_t texels = (size_t)kSourceMaxWidth * kSourceHeight;
+    g_gpu_hd = gnm_kernel("lanczos", &g_lanczos_kernel) &&
+               gnm_kernel("cas", &g_cas_kernel);
+    for (int i = 0; i < 5; i++)
+      g_gpu_hd = g_gpu_hd && gnm_kernel(names[i], &g_sfx_kernel[i]);
+    g_gpu_hd = g_gpu_hd &&
+        (g_sfx_m0 = GarlicAlloc(texels * 16)) && (g_sfx_s1 = GarlicAlloc(texels * 16)) &&
+        (g_sfx_p2 = GarlicAlloc(texels * 4)) && (g_sfx_p3 = GarlicAlloc(texels * 4)) &&
+        (g_sfx_x3 = GarlicAlloc(texels * kHdScale * kHdScale * 4)) &&
+        (g_lanczos_out = GarlicAlloc((size_t)kDisplayWidth * kDisplayHeight * 4)) &&
+        (g_lz_cols = GarlicAlloc(kDisplayWidth * 4)) &&
+        (g_lz_colw = GarlicAlloc(kDisplayWidth * sizeof(Taps))) &&
+        (g_lz_rows = GarlicAlloc(kDisplayHeight * 4)) &&
+        (g_lz_roww = GarlicAlloc(kDisplayHeight * sizeof(Taps)));
+  }
+  Log("GPU scaler: %s, HD %s", g_gpu ? "on" : "off (CPU nearest)",
+      g_gpu_hd ? "ScaleFX + Lanczos + CAS" : "xBR");
 }
 
-static bool DrawGameGpu(uint32_t *display, bool dim) {
-  const int source_width = Dkc2VideoWidth();
+/* Lanczos2 taps from a source of `source` texels onto `out` pixels. */
+static float Lanczos2(float x) {
+  const float pi = 3.14159265358979f;
+  if (x < 0) x = -x;
+  if (x < 1e-5f) return 1.0f;
+  if (x >= 2.0f) return 0.0f;
+  return 2.0f * sinf(pi * x) * sinf(pi * x * 0.5f) / (pi * pi * x * x);
+}
+
+static void LanczosTable(int source, int out, int32_t *first, Taps *weights) {
+  for (int i = 0; i < out; i++) {
+    const float u = ((float)i + 0.5f) * (float)source / (float)out - 0.5f;
+    const float base = floorf(u);
+    const float f = u - base;
+    Taps t;
+    float sum = 0.0f;
+    for (int k = 0; k < kLanczosTaps; k++) {
+      t.v[k] = Lanczos2(f - (float)(k - 1));
+      sum += t.v[k];
+    }
+    for (int k = 0; k < kLanczosTaps; k++) t.v[k] /= sum;
+    first[i] = (int32_t)base - 1;
+    weights[i] = t; /* sequential writes: fine for write-combined memory */
+  }
+}
+
+static void DispatchGrid(const GnmKernel *kernel, const void *args, size_t size,
+                         int width, int height) {
+  gnm_dispatch(kernel, args, (uint32_t)size, (uint32_t)(width + 7) / 8,
+               (uint32_t)(height + 7) / 8, 8, 8);
+}
+
+static void QueueHd(uint32_t *display, int w, bool dim) {
+  const int h = kSourceHeight;
+  if (w != g_lz_source_width || g_out_width != g_lz_out_width) {
+    LanczosTable(w * kHdScale, g_out_width, g_lz_cols, g_lz_colw);
+    LanczosTable(h * kHdScale, kDisplayHeight, g_lz_rows, g_lz_roww);
+    g_lz_source_width = w;
+    g_lz_out_width = g_out_width;
+  }
+#define P(x) ((uint64_t)(uintptr_t)(x))
+  struct { uint64_t a, b; uint32_t w, h; } a0 = {P(g_gpu_source), P(g_sfx_m0), w, h};
+  struct { uint64_t a, b; uint32_t w, h; } a1 = {P(g_sfx_m0), P(g_sfx_s1), w, h};
+  struct { uint64_t a, b, c; uint32_t w, h; } a2 = {P(g_sfx_m0), P(g_sfx_s1), P(g_sfx_p2), w, h};
+  struct { uint64_t a, b; uint32_t w, h; } a3 = {P(g_sfx_p2), P(g_sfx_p3), w, h};
+  struct { uint64_t a, b, c; uint32_t w, h; } a4 = {P(g_gpu_source), P(g_sfx_p3), P(g_sfx_x3), w, h};
+  struct {
+    uint64_t x3, cols, colw, rows, roww, out;
+    uint32_t w3, h3, out_w, out_h;
+  } al = {P(g_sfx_x3), P(g_lz_cols), P(g_lz_colw), P(g_lz_rows), P(g_lz_roww),
+          P(g_lanczos_out), (uint32_t)(w * kHdScale), (uint32_t)(h * kHdScale),
+          (uint32_t)g_out_width, kDisplayHeight};
+  struct {
+    uint64_t lz, dst;
+    uint32_t out_x, out_w, out_h, pitch, dim;
+    float sharpness;
+  } ac = {P(g_lanczos_out), P(display), (uint32_t)g_out_x, (uint32_t)g_out_width,
+          kDisplayHeight, kDisplayWidth, dim ? 1u : 0u, kCasSharpness};
+#undef P
+  DispatchGrid(&g_sfx_kernel[0], &a0, sizeof a0, w, h);
+  gnm_barrier();
+  DispatchGrid(&g_sfx_kernel[1], &a1, sizeof a1, w, h);
+  gnm_barrier();
+  DispatchGrid(&g_sfx_kernel[2], &a2, sizeof a2, w, h);
+  gnm_barrier();
+  DispatchGrid(&g_sfx_kernel[3], &a3, sizeof a3, w, h);
+  gnm_barrier();
+  DispatchGrid(&g_sfx_kernel[4], &a4, sizeof a4, w * kHdScale, h * kHdScale);
+  gnm_barrier();
+  DispatchGrid(&g_lanczos_kernel, &al, sizeof al, g_out_width, kDisplayHeight);
+  gnm_barrier();
+  DispatchGrid(&g_cas_kernel, &ac, sizeof ac, kDisplayWidth, kDisplayHeight);
+}
+
+static bool DrawGameGpu(uint32_t *display, const Frame *frame, bool dim) {
+  const int source_width = frame->width;
   if (source_width != g_mapped_width) MapColumns(source_width);
-  memcpy(g_gpu_source, g_pixels, (size_t)source_width * kSourceHeight * 4);
+  memcpy(g_gpu_source, frame->pixels, (size_t)source_width * kSourceHeight * 4);
   struct {
     uint64_t src, dst;
     uint32_t src_w, src_h, out_x, out_w, out_h, pitch, mode, dim;
@@ -298,8 +453,11 @@ static bool DrawGameGpu(uint32_t *display, bool dim) {
             (uint32_t)g_config.filter, dim ? 1u : 0u};
   const uint64_t start = sceKernelGetProcessTime();
   gnm_begin();
-  gnm_dispatch(&g_scale_kernel, &args, sizeof args, kDisplayWidth / 8,
-               (kDisplayHeight + 7) / 8, 8, 8);
+  if (g_config.filter == kFilterHd && g_gpu_hd)
+    QueueHd(display, source_width, dim);
+  else
+    gnm_dispatch(&g_scale_kernel, &args, sizeof args, kDisplayWidth / 8,
+                 (kDisplayHeight + 7) / 8, 8, 8);
   if (!gnm_finish()) {
     Log("GPU scaler failed: falling back to the CPU");
     g_gpu = false;
@@ -436,12 +594,9 @@ static void AudioReset(void) {
 
 static void PushAudio(const int16_t *samples, int frames) {
   if (g_audio < 0 || frames <= 0) return;
-  /* Steer the fill toward the target with at most +/-0.5 % pitch change. */
-  double error = ((double)RingFill() - kRingTarget) / kRingTarget;
-  if (error > 1.0) error = 1.0;
-  if (error < -1.0) error = -1.0;
-  const double step =
-      (double)kSnesRate / kOutputRate * (1.0 + 0.005 * error);
+  /* The emulation thread runs on the audio clock (it emulates whenever the
+   * ring is below its target), so the resampling ratio is exact. */
+  const double step = (double)kSnesRate / kOutputRate;
   uint32_t write = g_ring_write;
   const uint32_t space = kRingFrames - RingFill();
   uint32_t produced = 0;
@@ -656,7 +811,8 @@ static char g_menu_status[64];
 static void ApplyVideoConfig(void) {
   Dkc2VideoSetAspect(kAspects[g_config.aspect]);
   Dkc2VideoSetEdgePolicy((Dkc2VideoEdgePolicy)g_config.edge);
-  Dkc2BeginDrawing((uint8_t *)g_pixels, (size_t)Dkc2VideoWidth() * 4);
+  Dkc2BeginDrawing((uint8_t *)g_frames[g_frame_draw].pixels,
+                   (size_t)Dkc2VideoWidth() * 4);
 }
 
 static void DrawMenu(uint32_t *display) {
@@ -665,7 +821,7 @@ static void DrawMenu(uint32_t *display) {
   const int x0 = (kDisplayWidth - width) / 2, y0 = (kDisplayHeight - height) / 2;
   FillRect(display, x0, y0, width, height, 0xFF101830u);
   FillRect(display, x0, y0, width, 6, 0xFFFFD040u);
-  DrawTextCentered(display, y0 + 30, scale, 0xFFFFD040u, "DKC2 RECOMP PS4");
+  DrawTextCentered(display, y0 + 30, scale, 0xFFFFD040u, "DONKEY KONG COUNTRY 2");
   char text[64];
   for (int i = 0; i < kMenuCount; i++) {
     switch (i) {
@@ -719,11 +875,13 @@ static bool UpdateMenu(const Pad *pad, bool *reset_audio) {
       g_config.aspect = (g_config.aspect + kAspectCount + delta) % kAspectCount;
       ApplyVideoConfig();
       Dkc2DrawPpuFrame();
+      PublishFrame();
     } else if (g_menu_index == kMenuEdges) {
       g_config.edge = (g_config.edge + kDkc2VideoEdgePolicyCount + delta) %
                       kDkc2VideoEdgePolicyCount;
       ApplyVideoConfig();
       Dkc2DrawPpuFrame();
+      PublishFrame();
     } else if (g_menu_index == kMenuSlot) {
       g_config.slot = (g_config.slot + 5 + delta) % 5;
     }
@@ -745,6 +903,7 @@ static bool UpdateMenu(const Pad *pad, bool *reset_audio) {
       RtlSaveSlotPath(g_config.slot, path, sizeof path);
       if (RtlLoadSnapshot(path)) {
         Dkc2DrawPpuFrame();
+        PublishFrame();
         *reset_audio = true;
         snprintf(g_menu_status, sizeof g_menu_status, "RANURA %d CARGADA",
                  g_config.slot + 1);
@@ -761,6 +920,92 @@ static bool UpdateMenu(const Pad *pad, bool *reset_audio) {
       return true;
   }
   return false;
+}
+
+/* ------------------------------------------------------------ emulation */
+
+/* The emulation thread runs the game on the audio clock: it emulates a frame
+ * whenever the audio ring is below its target, so the game keeps the SNES's
+ * exact speed and the sound never starves while the presenter is busy.
+ * Everything that touches the emulator from the presenter (menu, states,
+ * aspect changes, exit) happens while this thread is parked. */
+static volatile uint32_t g_inputs;
+static volatile bool g_emu_pause_request, g_emu_paused, g_emu_failed;
+static volatile uint64_t g_emu_time_us, g_emu_worst_us, g_emu_frames;
+
+static void PauseEmulation(void) {
+  g_emu_pause_request = true;
+  while (!g_emu_paused && !g_emu_failed) sceKernelUsleep(500);
+}
+
+static void ResumeEmulation(void) { g_emu_pause_request = false; }
+
+static void *EmulationThread(void *unused) {
+  (void)unused;
+  int16_t frame_audio[600 * 2];
+  double audio_fraction = 0.0;
+  unsigned long long frame = 0;
+  bool was_paused = true;
+  uint64_t next_frame_time = 0; /* pacing without audio */
+  for (;;) {
+    if (g_emu_pause_request) {
+      g_emu_paused = true;
+      was_paused = true;
+      sceKernelUsleep(2000);
+      continue;
+    }
+    g_emu_paused = false;
+    if (was_paused) {
+      /* Resume with a cushion of silence instead of a burst of frames. */
+      was_paused = false;
+      AudioReset();
+      static const int16_t silence[256 * 2];
+      while (g_audio >= 0 && RingFill() + 256 < kRingTarget - 800)
+        PushAudio(silence, 171); /* 171 SNES frames ~ 256 output frames */
+      next_frame_time = sceKernelGetProcessTime();
+    }
+    if (g_audio >= 0) {
+      if (RingFill() >= kRingTarget) {
+        sceKernelUsleep(1000);
+        continue;
+      }
+    } else {
+      const uint64_t now = sceKernelGetProcessTime();
+      if (now < next_frame_time) {
+        sceKernelUsleep(1000);
+        continue;
+      }
+      next_frame_time += (uint64_t)(1000000.0 / kVideoRate);
+    }
+
+    const uint64_t start = sceKernelGetProcessTime();
+    (void)RtlRunFrame(g_inputs);
+    if (g_fail || !Dkc2LastLleResult()) {
+      Log("runtime stopped at frame %llu (resume PC $%06x)", frame + 1,
+          (unsigned)Dkc2ResumePc());
+      g_emu_failed = true;
+      return NULL;
+    }
+    Dkc2DrawPpuFrame();
+    audio_fraction += (double)kSnesRate / kVideoRate;
+    int audio_frames = (int)audio_fraction;
+    audio_fraction -= audio_frames;
+    RtlRenderAudio(frame_audio, audio_frames, 2);
+    Dkc2MusicMix(frame_audio, audio_frames, kSnesRate);
+    PushAudio(frame_audio, audio_frames);
+    PublishFrame();
+    frame++;
+    if (frame % 300 == 0) FlushSramIfChanged(false);
+
+    const uint64_t spent = sceKernelGetProcessTime() - start;
+    if (spent > 100000)
+      Log("slow frame %llu: %.1f ms (resume PC $%06x, audio fill %u)", frame,
+          spent / 1000.0, (unsigned)Dkc2ResumePc(), RingFill());
+    g_emu_time_us += spent;
+    if (spent > g_emu_worst_us) g_emu_worst_us = spent;
+    g_emu_frames++;
+  }
+  return NULL;
 }
 
 /* ----------------------------------------------------------------- game */
@@ -783,7 +1028,7 @@ static int GameMain(void) {
   const char *rom_path = FindRom();
   if (!rom_path) {
     static const char *const lines[] = {
-        "DKC2 RECOMP PS4", "NO SE ENCONTRO LA ROM",
+        "DONKEY KONG COUNTRY 2", "NO SE ENCONTRO LA ROM",
         "COPIA DKC2 USA V1.0 (SIN REV 1) A", "/DATA/DKC2/ROM.SFC",
         "PULSA X PARA SALIR"};
     Log("no ROM in " DATA_DIR);
@@ -794,7 +1039,7 @@ static int GameMain(void) {
   uint8_t *rom = Dkc2ReadVerifiedRom(rom_path, &rom_size, error, sizeof error);
   if (!rom) {
     static const char *const lines[] = {
-        "DKC2 RECOMP PS4", "ROM NO SOPORTADA",
+        "DONKEY KONG COUNTRY 2", "ROM NO SOPORTADA",
         "SE NECESITA DKC2 USA V1.0 (SIN REV 1)", "REVISA /DATA/DKC2/DEBUG.LOG",
         "PULSA X PARA SALIR"};
     Log("ROM rejected (%s): %s", rom_path, error);
@@ -806,7 +1051,7 @@ static int GameMain(void) {
   Dkc2MusicInitialize();
   RtlRegisterGame(Dkc2GameInfo());
   if (!SnesInit(rom, (int)rom_size)) {
-    static const char *const lines[] = {"DKC2 RECOMP PS4",
+    static const char *const lines[] = {"DONKEY KONG COUNTRY 2",
                                         "EL RUNTIME RECHAZO LA ROM",
                                         "PULSA X PARA SALIR"};
     MessageScreen(lines, 3);
@@ -818,94 +1063,89 @@ static int GameMain(void) {
       Dkc2VideoWidth(), kEdgeNames[g_config.edge]);
   sceSystemServiceHideSplashScreen();
 
-  int16_t frame_audio[600 * 2];
-  double audio_fraction = 0.0;
+  pthread_t emulation;
+  pthread_attr_t attributes;
+  pthread_attr_init(&attributes);
+  pthread_attr_setstacksize(&attributes, 16u * 1024u * 1024u);
+  if (pthread_create(&emulation, &attributes, EmulationThread, NULL) != 0) {
+    static const char *const lines[] = {"DONKEY KONG COUNTRY 2",
+                                        "NO SE PUDO INICIAR EL JUEGO",
+                                        "PULSA X PARA SALIR"};
+    MessageScreen(lines, 3);
+  }
+
   bool menu_open = false;
   bool ui_open = false;
-  unsigned long long frame = 0;
-  uint64_t stat_emulate = 0, stat_present = 0, stat_worst = 0;
-  unsigned stat_frames = 0, stat_catch_up = 0;
+  unsigned long long tick = 0;
+  uint64_t stat_present = 0, stat_start = sceKernelGetProcessTime();
+  unsigned stat_ticks = 0;
 
-  for (;;) {
+  for (;; tick++) {
     ReadPads();
-    if (frame % 6 == 0) {
+    if (g_emu_failed) {
+      FlushSramIfChanged(true);
+      static const char *const lines[] = {
+          "DONKEY KONG COUNTRY 2", "EL JUEGO SE DETUVO",
+          "REVISA /DATA/DKC2/DEBUG.LOG", "PULSA X PARA SALIR"};
+      MessageScreen(lines, 4);
+    }
+    if (tick % 6 == 0) {
       bool now_open = SystemUiOpen();
       if (now_open != ui_open) {
         ui_open = now_open;
         Log("system UI %s", ui_open ? "open: paused" : "closed: resumed");
-        if (ui_open) FlushSramIfChanged(false);
+        if (ui_open) {
+          PauseEmulation();
+          FlushSramIfChanged(false);
+        } else if (!menu_open) {
+          ResumeEmulation();
+        }
       }
     }
-    bool reset_audio = false;
     if (menu_open) {
+      bool reset_audio = false;
       if (UpdateMenu(&g_pads[0], &reset_audio)) {
         menu_open = false;
-        reset_audio = true;
+        if (!ui_open) ResumeEmulation();
       }
     } else if (Pressed(&g_pads[0], ORBIS_PAD_BUTTON_R3) && !ui_open) {
+      PauseEmulation();
       menu_open = true;
       g_menu_index = kMenuResume;
       g_menu_status[0] = 0;
     }
-    if (reset_audio) AudioReset();
+    g_inputs = menu_open ? 0u
+                         : SnesButtons(&g_pads[0]) |
+                               (SnesButtons(&g_pads[1]) << 12);
 
-    const uint64_t start = sceKernelGetProcessTime();
-    /* A slow frame (level loads take 30+ ms) leaves the audio ring short:
-     * emulate one extra frame to catch up instead of letting it run dry. */
-    int frames_to_run = 1;
-    if (frame > 120 && RingFill() < kCatchUpFill) {
-      frames_to_run = 2;
-      stat_catch_up++;
-    }
-    for (int run = 0; run < frames_to_run && !menu_open && !ui_open; run++) {
-      uint32_t inputs = SnesButtons(&g_pads[0]) |
-                        (SnesButtons(&g_pads[1]) << 12);
-      (void)RtlRunFrame(inputs);
-      if (g_fail || !Dkc2LastLleResult()) {
-        Log("runtime stopped at frame %llu (resume PC $%06x)", frame + 1,
-            (unsigned)Dkc2ResumePc());
-        FlushSramIfChanged(true);
-        static const char *const lines[] = {
-            "DKC2 RECOMP PS4", "EL JUEGO SE DETUVO",
-            "REVISA /DATA/DKC2/DEBUG.LOG", "PULSA X PARA SALIR"};
-        MessageScreen(lines, 4);
-      }
-      Dkc2DrawPpuFrame();
-      audio_fraction += (double)kSnesRate / kVideoRate;
-      int audio_frames = (int)audio_fraction;
-      audio_fraction -= audio_frames;
-      RtlRenderAudio(frame_audio, audio_frames, 2);
-      Dkc2MusicMix(frame_audio, audio_frames, kSnesRate);
-      PushAudio(frame_audio, audio_frames);
-      frame++;
-      if (frame % 300 == 0) FlushSramIfChanged(false);
-    }
-    if (ui_open) sceKernelUsleep(16000);
-    const uint64_t emulated = sceKernelGetProcessTime();
-
+    const Frame *frame = TakeFrame();
     uint32_t *display = BeginFrame();
-    if (!g_gpu || !DrawGameGpu(display, menu_open)) DrawGame(display, menu_open);
+    const uint64_t start = sceKernelGetProcessTime();
+    if (!g_gpu || !DrawGameGpu(display, frame, menu_open))
+      DrawGame(display, frame, menu_open);
     if (menu_open) DrawMenu(display);
     FinishFrame();
     if (g_gpu) gnm_frame_done();
-    const uint64_t presented = sceKernelGetProcessTime();
+    stat_present += sceKernelGetProcessTime() - start;
 
-    if (!menu_open && !ui_open) {
-      stat_emulate += emulated - start;
-      stat_present += presented - emulated;
-      if (emulated - start > stat_worst) stat_worst = emulated - start;
-      if (++stat_frames == 600) {
-        Log("perf: emulate %.2f ms avg (worst %.2f), present+wait %.2f ms, "
-            "gpu %.2f ms, filter %s, audio fill %u, catch-up frames %u",
-            stat_emulate / 600.0 / 1000.0, stat_worst / 1000.0,
-            stat_present / 600.0 / 1000.0, g_gpu_wait_us / 600.0 / 1000.0,
-            g_gpu ? kFilterNames[g_config.filter] : "CPU", RingFill(),
-            stat_catch_up);
-        stat_emulate = stat_present = stat_worst = 0;
-        stat_frames = 0;
-        stat_catch_up = 0;
-        g_gpu_wait_us = 0;
-      }
+    if (++stat_ticks == 600) {
+      const uint64_t now = sceKernelGetProcessTime();
+      const uint64_t frames = g_emu_frames;
+      Log("perf: %.1f fps shown, %llu frames emulated (%.2f ms avg, worst "
+          "%.2f), draw %.2f ms, gpu %.2f ms, filter %s, audio fill %u",
+          600.0 * 1000000.0 / (double)(now - stat_start),
+          (unsigned long long)frames,
+          frames ? g_emu_time_us / (double)frames / 1000.0 : 0.0,
+          g_emu_worst_us / 1000.0, stat_present / 600.0 / 1000.0,
+          g_gpu_wait_us / 600.0 / 1000.0,
+          g_gpu ? kFilterNames[g_config.filter] : "CPU", RingFill());
+      g_emu_frames = 0;
+      g_emu_time_us = 0;
+      g_emu_worst_us = 0;
+      g_gpu_wait_us = 0;
+      stat_present = 0;
+      stat_ticks = 0;
+      stat_start = now;
     }
   }
   return 0;

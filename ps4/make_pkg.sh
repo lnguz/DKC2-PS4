@@ -10,8 +10,8 @@ OUTDIR="$2"
 PS4_DIR="$(cd "$(dirname "$0")" && pwd)"
 TOOLS="$OO_PS4_TOOLCHAIN/bin/linux"
 
-TITLE="Donkey Kong Country 2 Recomp"
-VERSION="01.01"
+TITLE="Donkey Kong Country 2"
+VERSION="01.02"
 TITLE_ID="DKCR00002"
 CONTENT_ID="IV0000-DKCR00002_00-DKC2RECOMPPS4000"
 
@@ -45,5 +45,5 @@ cd "$STAGE"
     "eboot.bin sce_sys/about/right.sprx sce_sys/param.sfo sce_sys/icon0.png sce_module/libc.prx sce_module/libSceFios2.prx"
 "$TOOLS/PkgTool.Core" pkg_build pkg.gp4 "$OUTDIR"
 
-cp -f "$OUTDIR/$CONTENT_ID.pkg" "$OUTDIR/DKC2Recomp-PS4-$VERSION.pkg"
-echo "OK: $OUTDIR/DKC2Recomp-PS4-$VERSION.pkg"
+cp -f "$OUTDIR/$CONTENT_ID.pkg" "$OUTDIR/DKC2-PS4-$VERSION.pkg"
+echo "OK: $OUTDIR/DKC2-PS4-$VERSION.pkg"
