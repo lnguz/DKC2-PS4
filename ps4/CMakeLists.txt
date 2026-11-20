@@ -60,7 +60,10 @@ add_library(dkc2_ps4_core STATIC
     ${DKC2_ROOT}/runner/verified_rom.c)
 target_include_directories(dkc2_ps4_core PUBLIC ${DKC2_PS4_INCLUDES})
 target_compile_definitions(dkc2_ps4_core PUBLIC ${DKC2_PS4_DEFINITIONS})
-target_compile_options(dkc2_ps4_core PRIVATE -O2 -Wno-everything)
+# The PS4 CPU is an AMD Jaguar (btver2): SSE4.2, AVX, BMI, F16C. The PPU
+# renderer, about 75% of a frame, vectorizes much better with them.
+set(DKC2_PS4_CPU_FLAGS $<$<BOOL:${PS4}>:-march=btver2>)
+target_compile_options(dkc2_ps4_core PRIVATE -O3 ${DKC2_PS4_CPU_FLAGS} -Wno-everything)
 
 file(GLOB DKC2_SNESRECOMP_GEN_SOURCES CONFIGURE_DEPENDS
     "${DKC2_SNESRECOMP_GEN_DIR}/*.c")
@@ -102,7 +105,7 @@ add_executable(dkc2_ps4
     src/main.c
     src/gnm.c)
 target_include_directories(dkc2_ps4 PRIVATE src ${DKC2_PS4_INCLUDES})
-target_compile_options(dkc2_ps4 PRIVATE -O2 -Wno-everything)
+target_compile_options(dkc2_ps4 PRIVATE -O2 ${DKC2_PS4_CPU_FLAGS} -Wno-everything)
 target_link_libraries(dkc2_ps4 PRIVATE
     dkc2_ps4_core
     SceVideoOut SceAudioOut ScePad SceUserService SceSystemService

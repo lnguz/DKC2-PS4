@@ -66,7 +66,7 @@ int sceSystemServiceGetStatus(Ps4SystemStatus *status);
 #define DATA_DIR "/data/DKC2"
 #define LOG_PATH DATA_DIR "/debug.log"
 #define CONFIG_PATH DATA_DIR "/ps4.cfg"
-#define VERSION_TEXT "1.04"
+#define VERSION_TEXT "1.06"
 
 /* ------------------------------------------------------------------ log */
 
