@@ -42,6 +42,7 @@
 #include "verified_rom.h"
 
 #include "font.h"
+#include "gnm.h"
 
 /* Real prototypes: some OpenOrbis headers declare these without parameters. */
 int sceSystemServiceHideSplashScreen(void);
@@ -60,7 +61,7 @@ int sceSystemServiceGetStatus(Ps4SystemStatus *status);
 #define DATA_DIR "/data/DKC2"
 #define LOG_PATH DATA_DIR "/debug.log"
 #define CONFIG_PATH DATA_DIR "/ps4.cfg"
-#define VERSION_TEXT "1.00"
+#define VERSION_TEXT "1.01"
 
 /* ------------------------------------------------------------------ log */
 
@@ -100,7 +101,11 @@ typedef struct {
   int aspect;  /* index into kAspects */
   int edge;    /* Dkc2VideoEdgePolicy */
   int slot;    /* 0..4 */
+  int filter;  /* kFilterPixels or kFilterHd (GPU scaler) */
 } Ps4Config;
+
+enum { kFilterPixels, kFilterHd, kFilterCount };
+static const char *const kFilterNames[] = {"PIXELES", "HD"};
 
 static const Dkc2VideoAspect kAspects[] = {
     kDkc2VideoAspect16x9, kDkc2VideoAspect16x10, kDkc2VideoAspectNative};
@@ -109,7 +114,7 @@ enum { kAspectCount = 3 };
 static const char *const kEdgeNames[] = {"REFLEJAR", "BARRAS", "DESPLAZAR",
                                          "DESLIZAR"};
 
-static Ps4Config g_config = {0, kDkc2VideoEdgeGlide, 0};
+static Ps4Config g_config = {0, kDkc2VideoEdgeGlide, 0, kFilterHd};
 
 static void LoadConfig(void) {
   FILE *f = fopen(CONFIG_PATH, "r");
@@ -124,6 +129,8 @@ static void LoadConfig(void) {
       g_config.edge = value;
     else if (!strcmp(key, "slot") && value >= 0 && value < 5)
       g_config.slot = value;
+    else if (!strcmp(key, "filter") && value >= 0 && value < kFilterCount)
+      g_config.filter = value;
   }
   fclose(f);
 }
@@ -131,8 +138,8 @@ static void LoadConfig(void) {
 static void SaveConfig(void) {
   FILE *f = fopen(CONFIG_PATH, "w");
   if (!f) return;
-  fprintf(f, "aspect=%d\nedge=%d\nslot=%d\n", g_config.aspect, g_config.edge,
-          g_config.slot);
+  fprintf(f, "aspect=%d\nedge=%d\nslot=%d\nfilter=%d\n", g_config.aspect,
+          g_config.edge, g_config.slot, g_config.filter);
   fclose(f);
 }
 
@@ -265,6 +272,44 @@ static void DrawGame(uint32_t *display, bool dim) {
   }
 }
 
+/* GPU scaler (ps4/kernels/scale.cl): PIXELS = sharp bilinear, HD = xBR.
+ * Falls back to DrawGame on the CPU when the GPU path is unavailable. */
+static bool g_gpu;
+static GnmKernel g_scale_kernel;
+static uint32_t *g_gpu_source;
+static uint64_t g_gpu_wait_us;
+
+static void GpuInit(void) {
+  g_gpu = gnm_init() && gnm_kernel("scale", &g_scale_kernel) &&
+          (g_gpu_source = (uint32_t *)gnm_alloc_garlic(sizeof g_pixels, 256));
+  Log("GPU scaler: %s", g_gpu ? "on" : "off (CPU nearest)");
+}
+
+static bool DrawGameGpu(uint32_t *display, bool dim) {
+  const int source_width = Dkc2VideoWidth();
+  if (source_width != g_mapped_width) MapColumns(source_width);
+  memcpy(g_gpu_source, g_pixels, (size_t)source_width * kSourceHeight * 4);
+  struct {
+    uint64_t src, dst;
+    uint32_t src_w, src_h, out_x, out_w, out_h, pitch, mode, dim;
+  } args = {(uint64_t)(uintptr_t)g_gpu_source, (uint64_t)(uintptr_t)display,
+            (uint32_t)source_width, kSourceHeight, (uint32_t)g_out_x,
+            (uint32_t)g_out_width, kDisplayHeight, kDisplayWidth,
+            (uint32_t)g_config.filter, dim ? 1u : 0u};
+  const uint64_t start = sceKernelGetProcessTime();
+  gnm_begin();
+  gnm_dispatch(&g_scale_kernel, &args, sizeof args, kDisplayWidth / 8,
+               (kDisplayHeight + 7) / 8, 8, 8);
+  if (!gnm_finish()) {
+    Log("GPU scaler failed: falling back to the CPU");
+    g_gpu = false;
+    return false;
+  }
+  g_gpu_wait_us += sceKernelGetProcessTime() - start;
+  g_buffer_out_x[g_current_buffer] = -1; /* the GPU wrote the side bars */
+  return true;
+}
+
 /* Text: 5x7 glyphs drawn as scale x scale blocks (write-only to WC memory). */
 static void FillRect(uint32_t *display, int x, int y, int w, int h,
                      uint32_t color) {
@@ -308,7 +353,8 @@ enum {
   kOutputRate = 48000,
   kOutputBlock = 256,
   kRingFrames = 8192, /* power of two */
-  kRingTarget = 2048, /* ~43 ms of buffered audio */
+  kRingTarget = 2400, /* ~50 ms of buffered audio */
+  kCatchUpFill = 1100, /* below this, run an extra frame (one frame = ~800) */
 };
 static const double kVideoRate = 60.098811862;
 
@@ -595,6 +641,7 @@ static char *FindRom(void) {
 enum {
   kMenuResume,
   kMenuAspect,
+  kMenuFilter,
   kMenuEdges,
   kMenuSlot,
   kMenuSave,
@@ -625,6 +672,10 @@ static void DrawMenu(uint32_t *display) {
       case kMenuResume: snprintf(text, sizeof text, "CONTINUAR"); break;
       case kMenuAspect:
         snprintf(text, sizeof text, "FORMATO: < %s >", kAspectNames[g_config.aspect]);
+        break;
+      case kMenuFilter:
+        snprintf(text, sizeof text, "FILTRO: < %s >",
+                 g_gpu ? kFilterNames[g_config.filter] : "SIN GPU");
         break;
       case kMenuEdges:
         snprintf(text, sizeof text, "BORDES: < %s >", kEdgeNames[g_config.edge]);
@@ -659,10 +710,12 @@ static bool UpdateMenu(const Pad *pad, bool *reset_audio) {
   if (Pressed(pad, ORBIS_PAD_BUTTON_RIGHT)) delta = 1;
   const bool confirm = Pressed(pad, ORBIS_PAD_BUTTON_CROSS);
   if (confirm && (g_menu_index == kMenuAspect || g_menu_index == kMenuEdges ||
-                  g_menu_index == kMenuSlot))
+                  g_menu_index == kMenuSlot || g_menu_index == kMenuFilter))
     delta = 1;
   if (delta) {
-    if (g_menu_index == kMenuAspect) {
+    if (g_menu_index == kMenuFilter) {
+      g_config.filter = (g_config.filter + kFilterCount + delta) % kFilterCount;
+    } else if (g_menu_index == kMenuAspect) {
       g_config.aspect = (g_config.aspect + kAspectCount + delta) % kAspectCount;
       ApplyVideoConfig();
       Dkc2DrawPpuFrame();
@@ -724,6 +777,7 @@ static int GameMain(void) {
   scePadInit();
   if (!VideoInit()) return 1;
   if (!AudioInit()) Log("audio unavailable: continuing silent");
+  GpuInit();
   ReadPads();
 
   const char *rom_path = FindRom();
@@ -770,7 +824,7 @@ static int GameMain(void) {
   bool ui_open = false;
   unsigned long long frame = 0;
   uint64_t stat_emulate = 0, stat_present = 0, stat_worst = 0;
-  unsigned stat_frames = 0;
+  unsigned stat_frames = 0, stat_catch_up = 0;
 
   for (;;) {
     ReadPads();
@@ -796,7 +850,14 @@ static int GameMain(void) {
     if (reset_audio) AudioReset();
 
     const uint64_t start = sceKernelGetProcessTime();
-    if (!menu_open && !ui_open) {
+    /* A slow frame (level loads take 30+ ms) leaves the audio ring short:
+     * emulate one extra frame to catch up instead of letting it run dry. */
+    int frames_to_run = 1;
+    if (frame > 120 && RingFill() < kCatchUpFill) {
+      frames_to_run = 2;
+      stat_catch_up++;
+    }
+    for (int run = 0; run < frames_to_run && !menu_open && !ui_open; run++) {
       uint32_t inputs = SnesButtons(&g_pads[0]) |
                         (SnesButtons(&g_pads[1]) << 12);
       (void)RtlRunFrame(inputs);
@@ -818,15 +879,15 @@ static int GameMain(void) {
       PushAudio(frame_audio, audio_frames);
       frame++;
       if (frame % 300 == 0) FlushSramIfChanged(false);
-    } else if (ui_open) {
-      sceKernelUsleep(16000);
     }
+    if (ui_open) sceKernelUsleep(16000);
     const uint64_t emulated = sceKernelGetProcessTime();
 
     uint32_t *display = BeginFrame();
-    DrawGame(display, menu_open);
+    if (!g_gpu || !DrawGameGpu(display, menu_open)) DrawGame(display, menu_open);
     if (menu_open) DrawMenu(display);
     FinishFrame();
+    if (g_gpu) gnm_frame_done();
     const uint64_t presented = sceKernelGetProcessTime();
 
     if (!menu_open && !ui_open) {
@@ -835,11 +896,15 @@ static int GameMain(void) {
       if (emulated - start > stat_worst) stat_worst = emulated - start;
       if (++stat_frames == 600) {
         Log("perf: emulate %.2f ms avg (worst %.2f), present+wait %.2f ms, "
-            "audio fill %u",
+            "gpu %.2f ms, filter %s, audio fill %u, catch-up frames %u",
             stat_emulate / 600.0 / 1000.0, stat_worst / 1000.0,
-            stat_present / 600.0 / 1000.0, RingFill());
+            stat_present / 600.0 / 1000.0, g_gpu_wait_us / 600.0 / 1000.0,
+            g_gpu ? kFilterNames[g_config.filter] : "CPU", RingFill(),
+            stat_catch_up);
         stat_emulate = stat_present = stat_worst = 0;
         stat_frames = 0;
+        stat_catch_up = 0;
+        g_gpu_wait_us = 0;
       }
     }
   }

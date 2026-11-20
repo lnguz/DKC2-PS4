@@ -11,7 +11,7 @@ PS4_DIR="$(cd "$(dirname "$0")" && pwd)"
 TOOLS="$OO_PS4_TOOLCHAIN/bin/linux"
 
 TITLE="Donkey Kong Country 2 Recomp"
-VERSION="01.00"
+VERSION="01.01"
 TITLE_ID="DKCR00002"
 CONTENT_ID="IV0000-DKCR00002_00-DKC2RECOMPPS4000"
 

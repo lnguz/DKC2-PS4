@@ -10,6 +10,14 @@ SOURCE="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD="${1:-$SOURCE/build-ps4}"
 export OO_PS4_TOOLCHAIN="${OO_PS4_TOOLCHAIN:-$HOME/ps4dev/OpenOrbis/PS4Toolchain}"
 
+# GPU kernels (ps4/kernels/*.cl) -> ps4/src/gcn_kernels.h, with LLVM's AMDGPU
+# backend. Skipped without LLVM: the checked-in header is used as is.
+LLVM_BIN="${LLVM_BIN:-$HOME/dhd-tools/LLVM-23.1.6-Linux-X64/bin}"
+if [[ -x "$LLVM_BIN/clang" ]]; then
+    python3 -I "$SOURCE/ps4/tools/gcn_kernels.py" "$SOURCE/ps4/src/gcn_kernels.h" \
+        "$LLVM_BIN/clang" "$LLVM_BIN/ld.lld" >/dev/null
+fi
+
 cmake -S "$SOURCE/ps4" -B "$BUILD" -G Ninja \
     -DCMAKE_TOOLCHAIN_FILE="$SOURCE/ps4/openorbis.cmake" \
     -DCMAKE_BUILD_TYPE=Release

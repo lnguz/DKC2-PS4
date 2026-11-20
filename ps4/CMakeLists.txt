@@ -87,10 +87,11 @@ endforeach()
 add_executable(dkc2_ps4
     ${DKC2_SNESRECOMP_GEN_SOURCES}
     ${DKC2_ROOT}/runner/headless_host.c
-    src/main.c)
+    src/main.c
+    src/gnm.c)
 target_include_directories(dkc2_ps4 PRIVATE src ${DKC2_PS4_INCLUDES})
 target_compile_options(dkc2_ps4 PRIVATE -O2 -Wno-everything)
 target_link_libraries(dkc2_ps4 PRIVATE
     dkc2_ps4_core
     SceVideoOut SceAudioOut ScePad SceUserService SceSystemService
-    SceSysmodule m)
+    SceSysmodule SceGnmDriver m)
