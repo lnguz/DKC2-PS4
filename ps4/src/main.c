@@ -66,7 +66,7 @@ int sceSystemServiceGetStatus(Ps4SystemStatus *status);
 #define DATA_DIR "/data/DKC2"
 #define LOG_PATH DATA_DIR "/debug.log"
 #define CONFIG_PATH DATA_DIR "/ps4.cfg"
-#define VERSION_TEXT "1.03"
+#define VERSION_TEXT "1.04"
 
 /* ------------------------------------------------------------------ log */
 
@@ -111,10 +111,12 @@ static void OpenLog(void) {
 
 /* --------------------------------------------------------------- config */
 
+enum { kSlotCount = 9 }; /* save-state slots, saves/dkc2s0..8.sav */
+
 typedef struct {
   int aspect;  /* index into kAspects */
   int edge;    /* Dkc2VideoEdgePolicy */
-  int slot;    /* 0..4 */
+  int slot;    /* 0..kSlotCount-1 */
   int filter;  /* kFilterPixels or kFilterHd (GPU scaler) */
 } Ps4Config;
 
@@ -141,7 +143,7 @@ static void LoadConfig(void) {
     else if (!strcmp(key, "edge") && value >= 0 &&
              value < kDkc2VideoEdgePolicyCount)
       g_config.edge = value;
-    else if (!strcmp(key, "slot") && value >= 0 && value < 5)
+    else if (!strcmp(key, "slot") && value >= 0 && value < kSlotCount)
       g_config.slot = value;
     else if (!strcmp(key, "filter") && value >= 0 && value < kFilterCount)
       g_config.filter = value;
@@ -821,6 +823,13 @@ static void ApplyVideoConfig(void) {
                    (size_t)Dkc2VideoWidth() * 4);
 }
 
+static bool SlotUsed(int slot) {
+  char path[160];
+  struct stat st;
+  RtlSaveSlotPath(slot, path, sizeof path);
+  return stat(path, &st) == 0 && st.st_size > 0;
+}
+
 static void DrawMenu(uint32_t *display) {
   const int scale = 5, line = 64, width = 900;
   const int height = line * (kMenuCount + 3);
@@ -843,7 +852,8 @@ static void DrawMenu(uint32_t *display) {
         snprintf(text, sizeof text, "BORDES: < %s >", kEdgeNames[g_config.edge]);
         break;
       case kMenuSlot:
-        snprintf(text, sizeof text, "RANURA: < %d >", g_config.slot + 1);
+        snprintf(text, sizeof text, "RANURA: < %d > %s", g_config.slot + 1,
+                 SlotUsed(g_config.slot) ? "OCUPADA" : "VACIA");
         break;
       case kMenuSave: snprintf(text, sizeof text, "GUARDAR ESTADO"); break;
       case kMenuLoad: snprintf(text, sizeof text, "CARGAR ESTADO"); break;
@@ -908,7 +918,7 @@ static bool UpdateMenu(const Pad *pad, bool *reset_audio) {
       Dkc2DrawPpuFrame();
       PublishFrame();
     } else if (g_menu_index == kMenuSlot) {
-      g_config.slot = (g_config.slot + 5 + delta) % 5;
+      g_config.slot = (g_config.slot + kSlotCount + delta) % kSlotCount;
     }
     SaveConfig();
     g_menu_status[0] = 0;
