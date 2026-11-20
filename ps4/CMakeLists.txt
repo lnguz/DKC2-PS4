@@ -84,6 +84,18 @@ foreach(_script apply_dkc2_kongs_overrides.py apply_dkc2_music_overrides.py)
     endif()
 endforeach()
 
+if(NOT PS4)
+    # Desktop reproduction harness (ps4/tools/host_state_test.c).
+    add_executable(dkc2_host_state_test
+        ${DKC2_SNESRECOMP_GEN_SOURCES}
+        ${DKC2_ROOT}/runner/headless_host.c
+        tools/host_state_test.c)
+    target_include_directories(dkc2_host_state_test PRIVATE ${DKC2_PS4_INCLUDES})
+    target_compile_options(dkc2_host_state_test PRIVATE -O2 -Wno-everything)
+    target_link_libraries(dkc2_host_state_test PRIVATE dkc2_ps4_core m)
+    return()
+endif()
+
 add_executable(dkc2_ps4
     ${DKC2_SNESRECOMP_GEN_SOURCES}
     ${DKC2_ROOT}/runner/headless_host.c

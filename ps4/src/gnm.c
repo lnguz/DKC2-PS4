@@ -208,13 +208,6 @@ int gnm_finish(void)
     emit(value);
     emit(0);
     while (gnm.count & 7) emit(0x80000000u);  /* type-2 packets: padding */
-    if (gnm.fence_value == 1) {  /* the first buffer, in the log before the GPU sees it */
-        for (uint32_t i = 0; i < gnm.count; i += 8) {
-            fprintf(stderr, "gnm: %4u:", i);
-            for (uint32_t j = i; j < i + 8 && j < gnm.count; j++) fprintf(stderr, " %08x", gnm.commands[j]);
-            fprintf(stderr, "\n");
-        }
-    }
     __builtin_ia32_sfence();  /* the CPU's write-combined (garlic) writes reach memory before the GPU reads */
     const uint32_t *dcb[1] = {gnm.commands};
     uint32_t bytes[1] = {gnm.count * 4};

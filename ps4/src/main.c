@@ -41,6 +41,10 @@
 #include "dkc2_music.h"
 #include "dkc2_video.h"
 #include "verified_rom.h"
+#include "snes/apu.h"
+#include "snes/snes.h"
+
+extern int snes_frame_counter;
 
 #include "font.h"
 #include "gnm.h"
@@ -62,7 +66,7 @@ int sceSystemServiceGetStatus(Ps4SystemStatus *status);
 #define DATA_DIR "/data/DKC2"
 #define LOG_PATH DATA_DIR "/debug.log"
 #define CONFIG_PATH DATA_DIR "/ps4.cfg"
-#define VERSION_TEXT "1.02"
+#define VERSION_TEXT "1.03"
 
 /* ------------------------------------------------------------------ log */
 
@@ -83,7 +87,9 @@ static void Log(const char *format, ...) {
 
 static void OpenLog(void) {
   mkdir(DATA_DIR, 0777);
-  g_log = fopen(LOG_PATH, "w");
+  FILE *truncate = fopen(LOG_PATH, "w"); /* a fresh log per launch */
+  if (truncate) fclose(truncate);
+  g_log = fopen(LOG_PATH, "a"); /* appends, like the runtime's stderr */
   /* The runtime reports through stdout/stderr. The console refuses dup2 onto
    * descriptors 1 and 2, so the descriptor inside musl's FILE (offset 0x78,
    * the field fileno() reads; validated in the Downhill port) is pointed at
@@ -852,6 +858,25 @@ static void DrawMenu(uint32_t *display) {
     DrawTextCentered(display, y0 + height - 50, 4, 0xFF80FF80u, g_menu_status);
 }
 
+/* A save state restores the game's frame counter but not the SPC's
+ * guest-clock mapping (snesrecomp keeps that host-side and never rebases it
+ * on load), so the SPC would try to emulate every frame between the two
+ * clocks: seconds of stall on the console. Re-anchor the mapping at the
+ * current frame boundary and drop port writes queued before the load.
+ * 17088 = RTL_APU_CYCLES_PER_FRAME (common_rtl.c). Verified on the desktop
+ * with ps4/tools/host_state_test.c: no sync timeouts and 17088 SPC cycles per
+ * frame right after the load. */
+static void RebaseApuClock(void) {
+  Apu *apu = g_snes->apu;
+  const uint64_t guest = (uint64_t)snes_frame_counter * 17088u;
+  apu->portQHead = apu->portQTail;
+  apu->portGuestAnchor = guest;
+  apu->portTargetAnchor = apu->portClock;
+  apu->portLastGuest = guest;
+  apu->portLastTarget = apu->portClock;
+  apu->portTimeValid = true;
+}
+
 /* Returns true when the menu should close. */
 static bool UpdateMenu(const Pad *pad, bool *reset_audio) {
   if (Pressed(pad, ORBIS_PAD_BUTTON_CIRCLE) || Pressed(pad, ORBIS_PAD_BUTTON_R3) ||
@@ -902,6 +927,7 @@ static bool UpdateMenu(const Pad *pad, bool *reset_audio) {
     case kMenuLoad:
       RtlSaveSlotPath(g_config.slot, path, sizeof path);
       if (RtlLoadSnapshot(path)) {
+        RebaseApuClock();
         Dkc2DrawPpuFrame();
         PublishFrame();
         *reset_audio = true;
@@ -1014,6 +1040,8 @@ static int GameMain(void) {
   OpenLog();
   Log("DKC2Recomp PS4 " VERSION_TEXT " starting");
   chdir(DATA_DIR); /* kongs.cfg, msu1.cfg and other relative files */
+  /* code the recompiler missed (run by the interpreter) is journaled here */
+  setenv("SNESRECOMP_TIER2_JOURNAL", DATA_DIR "/tier2.jsonl", 1);
   mkdir(DATA_DIR "/saves", 0777);
   RtlSetSaveRoot(DATA_DIR "/saves");
   LoadConfig();
